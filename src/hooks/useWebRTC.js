@@ -7,10 +7,10 @@ const useWebRTC = (roomId, userId, localVideoRef, remoteVideoRef) => {
   const [remoteUserId, setRemoteUserId] = useState(null)
   const [callState, setCallState] = useState('disconnected')
   
-  // Gunakan useRef untuk values yang perlu persist across re-renders
   const localStreamRef = useRef(null)
   const peerConnectionRef = useRef(null)
   const isInitializedRef = useRef(false)
+  const pendingRoomJoinRef = useRef(null)
 
   const SERVER_URL = import.meta.env.VITE_SOCKET_URL || 'https://unmutualized-bryant-preplacental.ngrok-free.dev/'
 
@@ -18,19 +18,16 @@ const useWebRTC = (roomId, userId, localVideoRef, remoteVideoRef) => {
   const cleanup = useCallback(() => {
     console.log('🧹 Cleaning up WebRTC resources...')
     
-    // Stop local stream
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach(track => track.stop())
       localStreamRef.current = null
     }
     
-    // Close peer connection
     if (peerConnectionRef.current) {
       peerConnectionRef.current.close()
       peerConnectionRef.current = null
     }
     
-    // Clear video elements
     if (localVideoRef.current) {
       localVideoRef.current.srcObject = null
     }
@@ -41,13 +38,14 @@ const useWebRTC = (roomId, userId, localVideoRef, remoteVideoRef) => {
     setRemoteUserId(null)
     setCallState('disconnected')
     isInitializedRef.current = false
+    pendingRoomJoinRef.current = null
   }, [localVideoRef, remoteVideoRef])
 
   // Initialize Socket.IO - HANYA SEKALI
   useEffect(() => {
     if (isInitializedRef.current) return
     
-    console.log('🔌 Initializing Socket.IO connection...')
+    console.log('🔌 Initializing Socket.IO connection to:', SERVER_URL)
     const newSocket = io(SERVER_URL, {
       transports: ['websocket', 'polling'],
       timeout: 10000,
@@ -58,6 +56,14 @@ const useWebRTC = (roomId, userId, localVideoRef, remoteVideoRef) => {
       console.log('✅ Connected to server')
       setIsConnected(true)
       setCallState('connected')
+      
+      // Jika ada pending room join, execute sekarang
+      if (pendingRoomJoinRef.current) {
+        const { roomId, userId } = pendingRoomJoinRef.current
+        console.log('📨 Joining pending room:', roomId)
+        newSocket.emit('join-room', roomId, userId)
+        pendingRoomJoinRef.current = null
+      }
     })
 
     newSocket.on('connect_error', (error) => {
@@ -81,7 +87,7 @@ const useWebRTC = (roomId, userId, localVideoRef, remoteVideoRef) => {
     }
   }, [SERVER_URL])
 
-  // Initialize Media Stream - HANYA SEKALI
+  // Initialize Media Stream
   const initMediaStream = useCallback(async () => {
     try {
       if (localStreamRef.current) {
@@ -105,7 +111,7 @@ const useWebRTC = (roomId, userId, localVideoRef, remoteVideoRef) => {
     }
   }, [localVideoRef])
 
-  // Create Peer Connection - HANYA SATU
+  // Create Peer Connection
   const createPeerConnection = useCallback(() => {
     if (peerConnectionRef.current) {
       console.log('♻️ Reusing existing peer connection')
@@ -153,10 +159,6 @@ const useWebRTC = (roomId, userId, localVideoRef, remoteVideoRef) => {
       setCallState(pc.connectionState)
     }
 
-    pc.oniceconnectionstatechange = () => {
-      console.log('ICE connection state:', pc.iceConnectionState)
-    }
-
     peerConnectionRef.current = pc
     return pc
   }, [socket, remoteUserId, userId, roomId, remoteVideoRef])
@@ -170,7 +172,6 @@ const useWebRTC = (roomId, userId, localVideoRef, remoteVideoRef) => {
       if (data.userId !== userId) {
         setRemoteUserId(data.userId)
         setCallState('connecting')
-        // Create peer connection when remote user connects
         createPeerConnection()
       }
     }
@@ -233,20 +234,16 @@ const useWebRTC = (roomId, userId, localVideoRef, remoteVideoRef) => {
     }
   }, [socket, userId, roomId, remoteUserId, createPeerConnection, cleanup])
 
-  // Start call
+  // Start call - FIXED VERSION
   const startCall = useCallback(async () => {
-    if (!socket || !roomId) {
-      console.log('❌ Cannot start call: missing socket or roomId')
+    if (!roomId) {
+      console.log('❌ Cannot start call: missing roomId')
       return
     }
 
     console.log('📞 Starting call in room:', roomId)
     
-    // Join room first
-    socket.emit('join-room', roomId, userId)
-    console.log('✅ Joined room:', roomId)
-
-    // Initialize media
+    // Initialize media first
     const stream = await initMediaStream()
     if (!stream) {
       console.log('❌ Failed to get media stream')
@@ -254,7 +251,17 @@ const useWebRTC = (roomId, userId, localVideoRef, remoteVideoRef) => {
     }
 
     console.log('✅ Media stream initialized')
-  }, [socket, roomId, userId, initMediaStream])
+
+    // Jika socket sudah connected, join room langsung
+    if (socket && isConnected) {
+      console.log('✅ Socket connected, joining room now')
+      socket.emit('join-room', roomId, userId)
+    } else {
+      // Jika socket belum connected, simpan sebagai pending
+      console.log('⏳ Socket not connected yet, queuing room join')
+      pendingRoomJoinRef.current = { roomId, userId }
+    }
+  }, [socket, isConnected, roomId, userId, initMediaStream])
 
   // End call
   const endCall = useCallback(() => {
@@ -267,7 +274,15 @@ const useWebRTC = (roomId, userId, localVideoRef, remoteVideoRef) => {
     }
   }, [cleanup, socket, roomId, userId])
 
-  // Cleanup on unmount or room change
+  // Auto-start call ketika roomId berubah
+  useEffect(() => {
+    if (roomId && userId) {
+      console.log('🚀 Auto-starting call for room:', roomId)
+      startCall()
+    }
+  }, [roomId, userId, startCall])
+
+  // Cleanup on unmount
   useEffect(() => {
     return () => {
       console.log('🔄 Component unmounting, cleaning up...')
