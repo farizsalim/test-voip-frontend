@@ -11,7 +11,7 @@ const useWebRTC = (roomId, userId, localVideoRef, remoteVideoRef) => {
   const [remoteStream, setRemoteStream] = useState(null)
   const [peerConnection, setPeerConnection] = useState(null)
 
-  const SERVER_URL = 'https://voip-signal-server.vercel.app'
+  const SERVER_URL = 'voip-signal-server.vercel.app'
 
   // Initialize Socket.IO
   useEffect(() => {
