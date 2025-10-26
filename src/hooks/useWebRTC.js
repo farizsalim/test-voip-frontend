@@ -12,7 +12,7 @@ const useWebRTC = (roomId, userId, localVideoRef, remoteVideoRef) => {
   const isInitializedRef = useRef(false)
   const hasJoinedRoomRef = useRef(false) // ← NEW: Track if already joined room
 
-  const SERVER_URL = import.meta.env.VITE_SOCKET_URL || 'https://unmutualized-bryant-preplacental.ngrok-free.dev/'
+  const SERVER_URL = import.meta.env.VITE_SOCKET_URL || 'https://voip-test.loca.lt/'
 
   // Cleanup function
   const cleanup = useCallback(() => {
