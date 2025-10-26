@@ -12,7 +12,7 @@ const useWebRTC = (roomId, userId, localVideoRef, remoteVideoRef) => {
   const peerConnectionRef = useRef(null)
   const isInitializedRef = useRef(false)
 
-  const SERVER_URL = import.meta.env.VITE_SOCKET_URL || 'https://voip-signal-server.vercel.app'
+  const SERVER_URL = import.meta.env.VITE_SOCKET_URL || 'https://unmutualized-bryant-preplacental.ngrok-free.dev/'
 
   // Cleanup function
   const cleanup = useCallback(() => {
