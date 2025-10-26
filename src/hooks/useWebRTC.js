@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import io from 'socket.io-client'
 
 const useWebRTC = (roomId, userId, localVideoRef, remoteVideoRef) => {
@@ -7,57 +7,112 @@ const useWebRTC = (roomId, userId, localVideoRef, remoteVideoRef) => {
   const [remoteUserId, setRemoteUserId] = useState(null)
   const [callState, setCallState] = useState('disconnected')
   
-  const [localStream, setLocalStream] = useState(null)
-  const [remoteStream, setRemoteStream] = useState(null)
-  const [peerConnection, setPeerConnection] = useState(null)
+  // Gunakan useRef untuk values yang perlu persist across re-renders
+  const localStreamRef = useRef(null)
+  const peerConnectionRef = useRef(null)
+  const isInitializedRef = useRef(false)
 
-  const SERVER_URL = 'voip-signal-server.vercel.app'
+  const SERVER_URL = import.meta.env.VITE_SOCKET_URL || 'https://voip-signal-server.vercel.app'
 
-  // Initialize Socket.IO
+  // Cleanup function
+  const cleanup = useCallback(() => {
+    console.log('🧹 Cleaning up WebRTC resources...')
+    
+    // Stop local stream
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach(track => track.stop())
+      localStreamRef.current = null
+    }
+    
+    // Close peer connection
+    if (peerConnectionRef.current) {
+      peerConnectionRef.current.close()
+      peerConnectionRef.current = null
+    }
+    
+    // Clear video elements
+    if (localVideoRef.current) {
+      localVideoRef.current.srcObject = null
+    }
+    if (remoteVideoRef.current) {
+      remoteVideoRef.current.srcObject = null
+    }
+    
+    setRemoteUserId(null)
+    setCallState('disconnected')
+    isInitializedRef.current = false
+  }, [localVideoRef, remoteVideoRef])
+
+  // Initialize Socket.IO - HANYA SEKALI
   useEffect(() => {
+    if (isInitializedRef.current) return
+    
+    console.log('🔌 Initializing Socket.IO connection...')
     const newSocket = io(SERVER_URL, {
-      transports: ['websocket', 'polling']
+      transports: ['websocket', 'polling'],
+      timeout: 10000,
+      reconnectionAttempts: 3
     })
 
     newSocket.on('connect', () => {
-      console.log('Connected to server')
+      console.log('✅ Connected to server')
       setIsConnected(true)
       setCallState('connected')
     })
 
-    newSocket.on('disconnect', () => {
-      console.log('Disconnected from server')
+    newSocket.on('connect_error', (error) => {
+      console.error('❌ Connection failed:', error)
+      setIsConnected(false)
+      setCallState('connection_failed')
+    })
+
+    newSocket.on('disconnect', (reason) => {
+      console.log('🔌 Disconnected:', reason)
       setIsConnected(false)
       setCallState('disconnected')
     })
 
     setSocket(newSocket)
+    isInitializedRef.current = true
 
     return () => {
+      console.log('🔄 Socket cleanup')
       newSocket.close()
     }
-  }, [])
+  }, [SERVER_URL])
 
-  // Initialize Media Stream
+  // Initialize Media Stream - HANYA SEKALI
   const initMediaStream = useCallback(async () => {
     try {
+      if (localStreamRef.current) {
+        return localStreamRef.current
+      }
+      
+      console.log('🎥 Initializing media stream...')
       const stream = await navigator.mediaDevices.getUserMedia({
         video: true,
         audio: true
       })
-      setLocalStream(stream)
+      localStreamRef.current = stream
+      
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = stream
       }
       return stream
     } catch (error) {
-      console.error('Error accessing media devices:', error)
+      console.error('❌ Error accessing media devices:', error)
       return null
     }
   }, [localVideoRef])
 
-  // Create Peer Connection
+  // Create Peer Connection - HANYA SATU
   const createPeerConnection = useCallback(() => {
+    if (peerConnectionRef.current) {
+      console.log('♻️ Reusing existing peer connection')
+      return peerConnectionRef.current
+    }
+
+    console.log('🔄 Creating new peer connection...')
     const pc = new RTCPeerConnection({
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
@@ -66,16 +121,16 @@ const useWebRTC = (roomId, userId, localVideoRef, remoteVideoRef) => {
     })
 
     // Add local stream to peer connection
-    if (localStream) {
-      localStream.getTracks().forEach(track => {
-        pc.addTrack(track, localStream)
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach(track => {
+        pc.addTrack(track, localStreamRef.current)
       })
     }
 
     // Handle remote stream
     pc.ontrack = (event) => {
+      console.log('📹 Remote track received')
       const remoteStream = event.streams[0]
-      setRemoteStream(remoteStream)
       if (remoteVideoRef.current) {
         remoteVideoRef.current.srcObject = remoteStream
       }
@@ -83,7 +138,7 @@ const useWebRTC = (roomId, userId, localVideoRef, remoteVideoRef) => {
 
     // ICE candidate handling
     pc.onicecandidate = (event) => {
-      if (event.candidate && socket) {
+      if (event.candidate && socket && remoteUserId) {
         socket.emit('ice-candidate', {
           candidate: event.candidate,
           to: remoteUserId,
@@ -94,27 +149,35 @@ const useWebRTC = (roomId, userId, localVideoRef, remoteVideoRef) => {
     }
 
     pc.onconnectionstatechange = () => {
+      console.log('Peer connection state:', pc.connectionState)
       setCallState(pc.connectionState)
     }
 
-    setPeerConnection(pc)
+    pc.oniceconnectionstatechange = () => {
+      console.log('ICE connection state:', pc.iceConnectionState)
+    }
+
+    peerConnectionRef.current = pc
     return pc
-  }, [localStream, socket, remoteUserId, userId, roomId, remoteVideoRef])
+  }, [socket, remoteUserId, userId, roomId, remoteVideoRef])
 
   // Socket event handlers
   useEffect(() => {
     if (!socket) return
 
     const handleUserConnected = (data) => {
-      console.log('User connected:', data)
+      console.log('👤 User connected:', data)
       if (data.userId !== userId) {
         setRemoteUserId(data.userId)
         setCallState('connecting')
+        // Create peer connection when remote user connects
+        createPeerConnection()
       }
     }
 
     const handleOffer = async (data) => {
       if (data.from !== userId) {
+        console.log('📨 Received offer from:', data.from)
         setRemoteUserId(data.from)
         const pc = createPeerConnection()
         
@@ -128,29 +191,30 @@ const useWebRTC = (roomId, userId, localVideoRef, remoteVideoRef) => {
           from: userId,
           roomId: roomId
         })
+        console.log('📤 Sent answer to:', data.from)
       }
     }
 
     const handleAnswer = async (data) => {
-      if (data.from !== userId && peerConnection) {
-        await peerConnection.setRemoteDescription(data.answer)
+      if (data.from !== userId && peerConnectionRef.current) {
+        console.log('📨 Received answer from:', data.from)
+        await peerConnectionRef.current.setRemoteDescription(data.answer)
       }
     }
 
     const handleIceCandidate = async (data) => {
-      if (data.from !== userId && peerConnection) {
-        await peerConnection.addIceCandidate(data.candidate)
+      if (data.from !== userId && peerConnectionRef.current) {
+        console.log('🧊 Received ICE candidate from:', data.from)
+        await peerConnectionRef.current.addIceCandidate(data.candidate)
       }
     }
 
     const handleUserDisconnected = (data) => {
       if (data.userId === remoteUserId) {
+        console.log('👤 User disconnected:', data.userId)
         setRemoteUserId(null)
         setCallState('disconnected')
-        if (peerConnection) {
-          peerConnection.close()
-          setPeerConnection(null)
-        }
+        cleanup()
       }
     }
 
@@ -167,38 +231,49 @@ const useWebRTC = (roomId, userId, localVideoRef, remoteVideoRef) => {
       socket.off('ice-candidate', handleIceCandidate)
       socket.off('user-disconnected', handleUserDisconnected)
     }
-  }, [socket, userId, roomId, remoteUserId, peerConnection, createPeerConnection])
+  }, [socket, userId, roomId, remoteUserId, createPeerConnection, cleanup])
 
   // Start call
   const startCall = useCallback(async () => {
-    if (!socket || !roomId) return
+    if (!socket || !roomId) {
+      console.log('❌ Cannot start call: missing socket or roomId')
+      return
+    }
 
-    // Join room
+    console.log('📞 Starting call in room:', roomId)
+    
+    // Join room first
     socket.emit('join-room', roomId, userId)
+    console.log('✅ Joined room:', roomId)
 
     // Initialize media
     const stream = await initMediaStream()
-    if (!stream) return
+    if (!stream) {
+      console.log('❌ Failed to get media stream')
+      return
+    }
 
-    // Create peer connection if another user is expected
-    createPeerConnection()
-  }, [socket, roomId, userId, initMediaStream, createPeerConnection])
+    console.log('✅ Media stream initialized')
+  }, [socket, roomId, userId, initMediaStream])
 
   // End call
   const endCall = useCallback(() => {
-    if (localStream) {
-      localStream.getTracks().forEach(track => track.stop())
-    }
-    if (peerConnection) {
-      peerConnection.close()
-    }
+    console.log('📞 Ending call...')
+    cleanup()
+    
     if (socket) {
       socket.emit('leave-room', { roomId, userId })
       socket.emit('end-call', { roomId, userId })
     }
-    setRemoteUserId(null)
-    setCallState('disconnected')
-  }, [localStream, peerConnection, socket, roomId, userId])
+  }, [cleanup, socket, roomId, userId])
+
+  // Cleanup on unmount or room change
+  useEffect(() => {
+    return () => {
+      console.log('🔄 Component unmounting, cleaning up...')
+      cleanup()
+    }
+  }, [cleanup])
 
   return {
     isConnected,
