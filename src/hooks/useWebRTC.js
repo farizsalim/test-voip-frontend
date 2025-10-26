@@ -10,7 +10,7 @@ const useWebRTC = (roomId, userId, localVideoRef, remoteVideoRef) => {
   const localStreamRef = useRef(null)
   const peerConnectionRef = useRef(null)
   const isInitializedRef = useRef(false)
-  const pendingRoomJoinRef = useRef(null)
+  const hasJoinedRoomRef = useRef(false) // ← NEW: Track if already joined room
 
   const SERVER_URL = import.meta.env.VITE_SOCKET_URL || 'https://unmutualized-bryant-preplacental.ngrok-free.dev/'
 
@@ -37,19 +37,18 @@ const useWebRTC = (roomId, userId, localVideoRef, remoteVideoRef) => {
     
     setRemoteUserId(null)
     setCallState('disconnected')
-    isInitializedRef.current = false
-    pendingRoomJoinRef.current = null
+    hasJoinedRoomRef.current = false // ← RESET
   }, [localVideoRef, remoteVideoRef])
 
-  // Initialize Socket.IO - HANYA SEKALI
+  // Initialize Socket.IO
   useEffect(() => {
     if (isInitializedRef.current) return
     
     console.log('🔌 Initializing Socket.IO connection to:', SERVER_URL)
     const newSocket = io(SERVER_URL, {
-      transports: ['websocket', 'polling'],
+      transports: ['polling', 'websocket'],
       timeout: 10000,
-      reconnectionAttempts: 3
+      reconnectionAttempts: 5
     })
 
     newSocket.on('connect', () => {
@@ -57,12 +56,11 @@ const useWebRTC = (roomId, userId, localVideoRef, remoteVideoRef) => {
       setIsConnected(true)
       setCallState('connected')
       
-      // Jika ada pending room join, execute sekarang
-      if (pendingRoomJoinRef.current) {
-        const { roomId, userId } = pendingRoomJoinRef.current
-        console.log('📨 Joining pending room:', roomId)
+      // JOIN ROOM OTOMATIS ketika socket connected
+      if (roomId && userId && !hasJoinedRoomRef.current) {
+        console.log('🚀 Auto-joining room after connection:', roomId)
         newSocket.emit('join-room', roomId, userId)
-        pendingRoomJoinRef.current = null
+        hasJoinedRoomRef.current = true
       }
     })
 
@@ -76,16 +74,92 @@ const useWebRTC = (roomId, userId, localVideoRef, remoteVideoRef) => {
       console.log('🔌 Disconnected:', reason)
       setIsConnected(false)
       setCallState('disconnected')
+      hasJoinedRoomRef.current = false // Reset on disconnect
     })
+
+    // Socket event handlers
+    const handleUserConnected = (data) => {
+      console.log('👤 User connected:', data)
+      if (data.userId !== userId) {
+        setRemoteUserId(data.userId)
+        setCallState('connecting')
+        createPeerConnection()
+      }
+    }
+
+    const handleOffer = async (data) => {
+      if (data.from !== userId) {
+        console.log('📨 Received offer from:', data.from)
+        setRemoteUserId(data.from)
+        const pc = createPeerConnection()
+        
+        await pc.setRemoteDescription(data.offer)
+        const answer = await pc.createAnswer()
+        await pc.setLocalDescription(answer)
+
+        socket.emit('answer', {
+          answer: answer,
+          to: data.from,
+          from: userId,
+          roomId: roomId
+        })
+      }
+    }
+
+    const handleAnswer = async (data) => {
+      if (data.from !== userId && peerConnectionRef.current) {
+        console.log('📨 Received answer from:', data.from)
+        await peerConnectionRef.current.setRemoteDescription(data.answer)
+      }
+    }
+
+    const handleIceCandidate = async (data) => {
+      if (data.from !== userId && peerConnectionRef.current) {
+        console.log('🧊 Received ICE candidate from:', data.from)
+        await peerConnectionRef.current.addIceCandidate(data.candidate)
+      }
+    }
+
+    const handleUserDisconnected = (data) => {
+      if (data.userId === remoteUserId) {
+        console.log('👤 User disconnected:', data.userId)
+        cleanup()
+      }
+    }
+
+    const handleRoomUsers = (data) => {
+      console.log('👥 Users in room:', data.users)
+      // Jika ada user lain di room, create peer connection
+      const otherUsers = data.users.filter(u => u !== userId)
+      if (otherUsers.length > 0 && !remoteUserId) {
+        setRemoteUserId(otherUsers[0])
+        setCallState('connecting')
+        createPeerConnection()
+      }
+    }
+
+    // Register event listeners
+    newSocket.on('user-connected', handleUserConnected)
+    newSocket.on('offer', handleOffer)
+    newSocket.on('answer', handleAnswer)
+    newSocket.on('ice-candidate', handleIceCandidate)
+    newSocket.on('user-disconnected', handleUserDisconnected)
+    newSocket.on('room-users', handleRoomUsers)
 
     setSocket(newSocket)
     isInitializedRef.current = true
 
     return () => {
       console.log('🔄 Socket cleanup')
+      newSocket.off('user-connected', handleUserConnected)
+      newSocket.off('offer', handleOffer)
+      newSocket.off('answer', handleAnswer)
+      newSocket.off('ice-candidate', handleIceCandidate)
+      newSocket.off('user-disconnected', handleUserDisconnected)
+      newSocket.off('room-users', handleRoomUsers)
       newSocket.close()
     }
-  }, [SERVER_URL])
+  }, [SERVER_URL, roomId, userId]) // ← ADD roomId, userId sebagai dependencies
 
   // Initialize Media Stream
   const initMediaStream = useCallback(async () => {
@@ -126,14 +200,12 @@ const useWebRTC = (roomId, userId, localVideoRef, remoteVideoRef) => {
       ]
     })
 
-    // Add local stream to peer connection
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach(track => {
         pc.addTrack(track, localStreamRef.current)
       })
     }
 
-    // Handle remote stream
     pc.ontrack = (event) => {
       console.log('📹 Remote track received')
       const remoteStream = event.streams[0]
@@ -142,7 +214,6 @@ const useWebRTC = (roomId, userId, localVideoRef, remoteVideoRef) => {
       }
     }
 
-    // ICE candidate handling
     pc.onicecandidate = (event) => {
       if (event.candidate && socket && remoteUserId) {
         socket.emit('ice-candidate', {
@@ -163,105 +234,21 @@ const useWebRTC = (roomId, userId, localVideoRef, remoteVideoRef) => {
     return pc
   }, [socket, remoteUserId, userId, roomId, remoteVideoRef])
 
-  // Socket event handlers
-  useEffect(() => {
-    if (!socket) return
-
-    const handleUserConnected = (data) => {
-      console.log('👤 User connected:', data)
-      if (data.userId !== userId) {
-        setRemoteUserId(data.userId)
-        setCallState('connecting')
-        createPeerConnection()
-      }
-    }
-
-    const handleOffer = async (data) => {
-      if (data.from !== userId) {
-        console.log('📨 Received offer from:', data.from)
-        setRemoteUserId(data.from)
-        const pc = createPeerConnection()
-        
-        await pc.setRemoteDescription(data.offer)
-        const answer = await pc.createAnswer()
-        await pc.setLocalDescription(answer)
-
-        socket.emit('answer', {
-          answer: answer,
-          to: data.from,
-          from: userId,
-          roomId: roomId
-        })
-        console.log('📤 Sent answer to:', data.from)
-      }
-    }
-
-    const handleAnswer = async (data) => {
-      if (data.from !== userId && peerConnectionRef.current) {
-        console.log('📨 Received answer from:', data.from)
-        await peerConnectionRef.current.setRemoteDescription(data.answer)
-      }
-    }
-
-    const handleIceCandidate = async (data) => {
-      if (data.from !== userId && peerConnectionRef.current) {
-        console.log('🧊 Received ICE candidate from:', data.from)
-        await peerConnectionRef.current.addIceCandidate(data.candidate)
-      }
-    }
-
-    const handleUserDisconnected = (data) => {
-      if (data.userId === remoteUserId) {
-        console.log('👤 User disconnected:', data.userId)
-        setRemoteUserId(null)
-        setCallState('disconnected')
-        cleanup()
-      }
-    }
-
-    socket.on('user-connected', handleUserConnected)
-    socket.on('offer', handleOffer)
-    socket.on('answer', handleAnswer)
-    socket.on('ice-candidate', handleIceCandidate)
-    socket.on('user-disconnected', handleUserDisconnected)
-
-    return () => {
-      socket.off('user-connected', handleUserConnected)
-      socket.off('offer', handleOffer)
-      socket.off('answer', handleAnswer)
-      socket.off('ice-candidate', handleIceCandidate)
-      socket.off('user-disconnected', handleUserDisconnected)
-    }
-  }, [socket, userId, roomId, remoteUserId, createPeerConnection, cleanup])
-
-  // Start call - FIXED VERSION
+  // Start call - SIMPLIFIED
   const startCall = useCallback(async () => {
-    if (!roomId) {
-      console.log('❌ Cannot start call: missing roomId')
+    if (!roomId || !userId) {
+      console.log('❌ Cannot start call: missing roomId or userId')
       return
     }
 
-    console.log('📞 Starting call in room:', roomId)
+    console.log('📞 Starting call for:', userId, 'in room:', roomId)
     
-    // Initialize media first
-    const stream = await initMediaStream()
-    if (!stream) {
-      console.log('❌ Failed to get media stream')
-      return
-    }
-
-    console.log('✅ Media stream initialized')
-
-    // Jika socket sudah connected, join room langsung
-    if (socket && isConnected) {
-      console.log('✅ Socket connected, joining room now')
-      socket.emit('join-room', roomId, userId)
-    } else {
-      // Jika socket belum connected, simpan sebagai pending
-      console.log('⏳ Socket not connected yet, queuing room join')
-      pendingRoomJoinRef.current = { roomId, userId }
-    }
-  }, [socket, isConnected, roomId, userId, initMediaStream])
+    // Initialize media
+    await initMediaStream()
+    
+    // Join room akan terjadi otomatis di socket connect handler
+    // karena kita sudah punya roomId dan userId
+  }, [roomId, userId, initMediaStream])
 
   // End call
   const endCall = useCallback(() => {
@@ -270,11 +257,10 @@ const useWebRTC = (roomId, userId, localVideoRef, remoteVideoRef) => {
     
     if (socket) {
       socket.emit('leave-room', { roomId, userId })
-      socket.emit('end-call', { roomId, userId })
     }
   }, [cleanup, socket, roomId, userId])
 
-  // Auto-start call ketika roomId berubah
+  // Auto-start ketika component mount atau roomId berubah
   useEffect(() => {
     if (roomId && userId) {
       console.log('🚀 Auto-starting call for room:', roomId)
